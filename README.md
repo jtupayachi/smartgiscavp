@@ -51,8 +51,8 @@ Page types supported:
 ## Quick Start
 
 ```bash
-git clone https://github.com/jtupayachi/nsrd_ui.git
-cd nsrd_ui/nsrd_ui
+git clone https://github.com/jtupayachi/smartgiscavp_ui.git
+cd smartgiscavp/smartgiscavp
 cp .env.example .env          # edit OLLAMA_HOST and credentials
 docker compose up --build
 ```
@@ -68,7 +68,7 @@ Open **http://localhost:8432** in your browser.
 All credentials live in **`.env`** — never hardcoded. Copy the template and fill in your values:
 
 ```bash
-cp nsrd_ui/.env.example nsrd_ui/.env
+cp smartgiscavp/.env.example smartgiscavp/.env
 ```
 
 ```ini
@@ -122,8 +122,8 @@ You can use the **same model for both** if compute is limited.
 ## Project Structure
 
 ```
-nsrd_ui/
-├── nsrd_ui/                   ← Main application (git root)
+smartgiscavp/
+├── smartgiscavp/                   ← Main application (git root)
 │   ├── src/                   ← React frontend (TypeScript)
 │   │   ├── App.tsx            ← Main UI component
 │   │   ├── App.css            ← Swiss brutalist theme
@@ -172,7 +172,7 @@ Golden examples live in `reference-codebases/golden-examples/src/` — add your 
 | `PORT` | `80` | Express backend port |
 | `VIRTUAL_HOST` | *(blank)* | nginx-proxy reverse-proxy hostname |
 
-See `nsrd_ui/.env.example` for a full annotated template.
+See `smartgiscavp/.env.example` for a full annotated template.
 
 ---
 
@@ -259,7 +259,7 @@ If your program could benefit from AI-assisted rapid application development for
 |---|---|
 | **Xiao-Ying Yu, Ph.D.** — PI, ORNL | [Staff Profile](https://www.ornl.gov/staff-profile/xiao-ying-yu) |
 | **Jose Tupayachi** — Developer | [jtupayachi.github.io](https://jtupayachi.github.io/) |
-| **Repository** | [github.com/jtupayachi/nsrd_ui](https://github.com/jtupayachi/nsrd_ui) |
+| **Repository** | [github.com/jtupayachi/smartgiscavp](https://github.com/jtupayachi/smartgiscavp) |
 | **Container** | [hub.docker.com/r/jtupayac/smartgiscavp](https://hub.docker.com/r/jtupayac/smartgiscavp) |
 
 ---
