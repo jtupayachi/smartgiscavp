@@ -10,7 +10,7 @@
 [![React](https://img.shields.io/badge/React-18-61dafb?logo=react)](https://reactjs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-4.9-3178c6?logo=typescript)](https://typescriptlang.org)
 [![Ollama](https://img.shields.io/badge/Ollama-LLM-ff6b35)](https://ollama.ai)
-[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-jtupayac%2Fnsrd--ui-2496ed?logo=docker)](https://hub.docker.com/r/jtupayac/smartgiscavp)
+[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-jtupayac%2Fsmartgiscavp-2496ed?logo=docker)](https://hub.docker.com/r/jtupayac/smartgiscavp)
 [![ORNL](https://img.shields.io/badge/Oak%20Ridge-National%20Laboratory-00629b)](https://ornl.gov)
 
 </div>
