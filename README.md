@@ -10,7 +10,7 @@
 [![React](https://img.shields.io/badge/React-18-61dafb?logo=react)](https://reactjs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-4.9-3178c6?logo=typescript)](https://typescriptlang.org)
 [![Ollama](https://img.shields.io/badge/Ollama-LLM-ff6b35)](https://ollama.ai)
-[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-jtupayac%2Fnsrd--ui-2496ed?logo=docker)](https://hub.docker.com/r/jtupayac/nsrd-ui)
+[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-jtupayac%2Fnsrd--ui-2496ed?logo=docker)](https://hub.docker.com/r/jtupayac/smartgiscavp)
 [![ORNL](https://img.shields.io/badge/Oak%20Ridge-National%20Laboratory-00629b)](https://ornl.gov)
 
 </div>
@@ -153,7 +153,7 @@ The Python microservice runs inside Docker automatically:
 
 ```bash
 # Manually rebuild the RAG index:
-docker exec nsrd-ui python3 rag_server.py
+docker exec smartgiscavp python3 rag_server.py
 ```
 
 Golden examples live in `reference-codebases/golden-examples/src/` — add your own `.jsx` files there to extend what the LLM can reference.
@@ -190,12 +190,12 @@ environment:
 ### Pull from Docker Hub
 
 ```bash
-docker pull jtupayac/nsrd-ui
+docker pull jtupayac/smartgiscavp
 docker run -p 8432:80 \
   -e OLLAMA_HOST=http://your-ollama:11434 \
   -e OLLAMA_USER=your_user \
   -e OLLAMA_PASSWORD=your_pass \
-  jtupayac/nsrd-ui
+  jtupayac/smartgiscavp
 ```
 
 ---
@@ -260,7 +260,7 @@ If your program could benefit from AI-assisted rapid application development for
 | **Xiao-Ying Yu, Ph.D.** — PI, ORNL | [Staff Profile](https://www.ornl.gov/staff-profile/xiao-ying-yu) |
 | **Jose Tupayachi** — Developer | [jtupayachi.github.io](https://jtupayachi.github.io/) |
 | **Repository** | [github.com/jtupayachi/nsrd_ui](https://github.com/jtupayachi/nsrd_ui) |
-| **Container** | [hub.docker.com/r/jtupayac/nsrd-ui](https://hub.docker.com/r/jtupayac/nsrd-ui) |
+| **Container** | [hub.docker.com/r/jtupayac/smartgiscavp](https://hub.docker.com/r/jtupayac/smartgiscavp) |
 
 ---
 
@@ -276,6 +276,6 @@ MIT © Oak Ridge National Laboratory
 |:---:|:---:|
 | **PI** | [Xiao-Ying Yu, Ph.D.](https://www.ornl.gov/staff-profile/xiao-ying-yu) · Oak Ridge National Laboratory |
 | **Dev** | [Jose Tupayachi](https://jtupayachi.github.io/) · UTK / ORNL |
-| **Container** | [`docker pull jtupayac/nsrd-ui`](https://hub.docker.com/r/jtupayac/nsrd-ui) |
+| **Container** | [`docker pull jtupayac/smartgiscavp`](https://hub.docker.com/r/jtupayac/smartgiscavp) |
 
 </div>
