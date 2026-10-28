@@ -10,6 +10,24 @@ A dockerized React application that generates live applications from OpenAPI spe
 - 🐳 **Dockerized**: Fully containerized for easy deployment
 - ⚡ **Development Mode**: Hot-reload enabled for rapid development
 
+## Local deployment with vLLM via LiteLLM
+
+Release 2 calls a vLLM server through a LiteLLM proxy (OpenAI-compatible `/v1/chat/completions`) instead of Ollama. `docker-compose.yml` joins the external docker network of the LiteLLM container (`local-gateway_default`; change the name to match your gateway). Default model: `ornl-qwen3-8-27b` (Qwen3.8-27B served by vLLM):
+
+```bash
+cp .env.litellm.example .env.litellm   # set OPENAI_API_KEY to the LiteLLM key (chmod 600, never commit)
+docker compose up -d --build           # UI + API on http://localhost:8432
+docker compose restart nsrd-ui         # after editing server.js / pipeline.js (bind-mounted)
+docker compose up -d --build -V        # after dependency changes (refreshes the node_modules volumes)
+```
+
+Generated projects use the named volume `projects_data`. Set `NSRD_PROJECTS_DIR=/host/path` in `.env` to bind-mount a host directory instead. Container logs are capped at 5 × 50 MB.
+
+Relevant variables: `LLM_PROVIDER=openai` (default; `ollama` restores the release-1 Ollama backend), `OPENAI_BASE_URL=http://litellm:4000/v1`, `LLM_DEFAULT_MODEL=ornl-qwen3-8-27b`,
+`LLM_THINKER_ENABLE_THINKING` and `LLM_CODER_ENABLE_THINKING` (Qwen3 `enable_thinking`).
+
+Experiment support (scaled-up evaluation, https://huggingface.co/datasets/jtupayac/smartgiscavp-scaled-experiment): the pipeline accepts an OpenAPI spec as context, and generated apps may import `@turf/turf`. Each repair round is snapshotted to `projects/_rounds/<id>/r<k>` and served at `/preview/<id>--r<k>/`. Telemetry is available at `GET /api/pipeline/telemetry/<id>`, round sources at `GET /api/pipeline/rounds/<id>/<k>/src`, and a fixture-driven mock REST API at `/mock/<fixture>/*` (fixtures are registered via `/api/mock/fixtures`).
+
 ## Project Structure
 
 ```

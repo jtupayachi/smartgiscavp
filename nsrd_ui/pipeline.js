@@ -41,11 +41,29 @@ const authHeader  = (USERNAME && PASSWORD)
   ? 'Basic ' + Buffer.from(`${USERNAME}:${PASSWORD}`).toString('base64')
   : (process.env.OLLAMA_API_KEY ? `Bearer ${process.env.OLLAMA_API_KEY}` : '');
 
+// OpenAI-compatible backend (LiteLLM proxy in front of vLLM).
+// Release 2: the default backend is OpenAI-compatible (/v1/chat/completions, e.g. vLLM behind LiteLLM).
+// LLM_PROVIDER=ollama restores the legacy Ollama-native endpoints of release 1.
+const LLM_PROVIDER     = (process.env.LLM_PROVIDER || 'openai').toLowerCase();
+const OPENAI_BASE_URL  = (process.env.OPENAI_BASE_URL || 'http://litellm:4000/v1').replace(/\/+$/, '');
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY || '';
+const LLM_DEFAULT_MODEL = process.env.LLM_DEFAULT_MODEL || 'ornl-qwen3-8-27b';
+const envBool = (v, d) => (v === undefined || v === '' ? d : /^(1|true|yes|on)$/i.test(v));
+const THINKER_ENABLE_THINKING = envBool(process.env.LLM_THINKER_ENABLE_THINKING, true);
+const CODER_ENABLE_THINKING   = envBool(process.env.LLM_CODER_ENABLE_THINKING, false);
+const THINKING_TOKEN_BUDGET   = parseInt(process.env.LLM_THINKING_TOKEN_BUDGET || '16384', 10);
+
+// Per-run sampling overrides (temperature, top_p, seed, …) — set by server.js for each
+// pipeline job so concurrent experiment runs can use independent seeds.
+const { AsyncLocalStorage } = require('async_hooks');
+const llmContext = new AsyncLocalStorage();
+const runOverrides = () => llmContext.getStore() || {};
+
 const PROJECTS_DIR = path.join(__dirname, 'projects');
 const TEMPLATE_DIR = path.join(__dirname, 'templates', 'react-app');
 
 /* Deep-thinking model for architectural reasoning — swap to qwen3-coder:480b when available */
-const THINKER_MODEL = 'qwen3-coder-next:latest';
+const THINKER_MODEL = LLM_PROVIDER === 'openai' ? LLM_DEFAULT_MODEL : 'qwen3-coder-next:latest';
 
 /* ─── Helper: infer semantic roles for CSV columns ──────────────────────── */
 // Normalize a CSV header the same way the Papa.parse transformHeader does,
@@ -53,6 +71,83 @@ const THINKER_MODEL = 'qwen3-coder-next:latest';
 // e.g. "Latitude (DD)", "LAT_WGS84", " lat " → "latitude_dd", "lat_wgs84", "lat"
 function normalizeHeader(h) {
   return h.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+}
+
+/* ─── OpenAPI data source ─────────────────────────────────────────────────
+   A page may carry `openApiFile: { name, content }` (JSON or YAML OpenAPI 3.x).
+   When present the page loads its data from that REST API at runtime instead of a CSV. */
+function parseOpenApi(pg) {
+  if (!pg || !pg.openApiFile || !pg.openApiFile.content) return null;
+  const raw = pg.openApiFile.content;
+  let spec = null;
+  try { spec = JSON.parse(raw); } catch {
+    try { spec = require('js-yaml').load(raw); } catch { spec = null; }
+  }
+  return { raw, spec: spec && typeof spec === 'object' ? spec : null };
+}
+
+function schemaSignature(schema, spec, depth = 0) {
+  if (!schema || depth > 5) return 'any';
+  if (schema.$ref) {
+    const ref = schema.$ref.replace(/^#\//, '').split('/').reduce((o, k) => (o ? o[k] : undefined), spec);
+    return schemaSignature(ref, spec, depth + 1);
+  }
+  if (schema.enum) return schema.enum.map((v) => JSON.stringify(v)).join('|');
+  if (schema.type === 'array') return `[${schemaSignature(schema.items, spec, depth + 1)}]`;
+  if (schema.type === 'object' || schema.properties) {
+    const props = Object.entries(schema.properties || {}).map(([k, v]) => `${k}: ${schemaSignature(v, spec, depth + 1)}`);
+    return `{ ${props.join(', ')} }`;
+  }
+  return schema.type || 'any';
+}
+
+function summarizeOpenApi(spec) {
+  const base = (spec.servers && spec.servers[0] && spec.servers[0].url) || '';
+  const ops = [];
+  for (const [p, item] of Object.entries(spec.paths || {})) {
+    for (const [method, op] of Object.entries(item || {})) {
+      if (!['get', 'post', 'put', 'delete', 'patch'].includes(method)) continue;
+      const params = [...(item.parameters || []), ...(op.parameters || [])].map((x) => {
+        const sch = x.schema || {};
+        return `${x.name} (${x.in}${x.required ? ', required' : ''}${sch.enum ? `, one of ${sch.enum.join('|')}` : sch.type ? `, ${sch.type}` : ''})`;
+      });
+      const ok = (op.responses || {})['200'] || (op.responses || {})['201'];
+      const sch = ok && ok.content && (ok.content['application/json'] || ok.content['application/geo+json'] || Object.values(ok.content)[0]);
+      ops.push({
+        line: `${method.toUpperCase()} ${base}${p}${op.summary ? ` — ${op.summary}` : ''}`,
+        params: params.length ? `params: ${params.join('; ')}` : '',
+        response: sch && sch.schema ? `200 → ${schemaSignature(sch.schema, spec)}` : '',
+      });
+    }
+  }
+  return { base, title: (spec.info && spec.info.title) || 'API', version: spec.openapi || spec.swagger || '?', ops };
+}
+
+/** Prompt lines describing a page's OpenAPI data source (empty array if none). */
+function openApiContextLines(pg, indent = '  ', includeRaw = false) {
+  const o = parseOpenApi(pg);
+  if (!o) return [];
+  const lines = [];
+  if (o.spec) {
+    const s = summarizeOpenApi(o.spec);
+    lines.push(`${indent}DATA SOURCE: REST API "${s.title}" (OpenAPI ${s.version}). NO CSV is provided for this page — do NOT invent inline/sample data.`);
+    lines.push(`${indent}Base URL: ${s.base}  (same-origin absolute path — call fetch('${s.base}/…') exactly, never add a host)`);
+    lines.push(`${indent}Endpoints:`);
+    for (const op of s.ops) {
+      lines.push(`${indent}  • ${op.line}`);
+      if (op.params) lines.push(`${indent}      ${op.params}`);
+      if (op.response) lines.push(`${indent}      ${op.response}`);
+    }
+  } else {
+    lines.push(`${indent}DATA SOURCE: REST API described by the OpenAPI document below. NO CSV is provided — do NOT invent data.`);
+  }
+  lines.push(`${indent}Load data with fetch() inside useEffect (state initialised to []), and read the response EXACTLY as documented`);
+  lines.push(`${indent}(envelope keys, property names; GeoJSON geometry.coordinates are [lng, lat]). Only call documented endpoints.`);
+  if (includeRaw) {
+    const raw = o.raw.length > 8000 ? o.raw.slice(0, 8000) + '\n… (truncated)' : o.raw;
+    lines.push(`${indent}OpenAPI document (${pg.openApiFile.name || 'openapi'}):`, '```', raw, '```');
+  }
+  return lines;
 }
 
 // Legacy thin wrapper — kept so callers that only need col names still work.
@@ -402,6 +497,8 @@ function buildThinkPrompt(pages, opts = {}) {
         } else {
           lines.push(`  CSV is a static asset at /data/${pg.name.replace(/[^a-zA-Z0-9]/g, '')}.csv — fetch() at runtime`);
         }
+      } else if (pg.openApiFile) {
+        lines.push(...openApiContextLines(pg, '  '));
       } else {
         lines.push('  ⚠ No CSV provided — use placeholder coordinates or a basic map view.');
       }
@@ -420,6 +517,8 @@ function buildThinkPrompt(pages, opts = {}) {
         } else {
           lines.push(`  CSV is a static asset at /data/${pg.name.replace(/[^a-zA-Z0-9]/g, '')}.csv — fetch() at runtime`);
         }
+      } else if (pg.openApiFile) {
+        lines.push(...openApiContextLines(pg, '  '));
       } else {
         lines.push('  ⚠ No CSV provided — use sample/hardcoded data for chart demonstration.');
       }
@@ -448,6 +547,7 @@ function buildThinkPrompt(pages, opts = {}) {
   //   SVG tag/id names   → layout intent: sidebar, map, chart, table, legend, header…
   const ragQuery = pages.map(pg => {
     const parts = [pg.name, pg.type, pg.requirements || ''];
+    if (pg.openApiFile) parts.push('REST API OpenAPI fetch JSON GeoJSON');
     if (pg.csvFile) {
       const csvHeader = pg.csvFile.content.split('\n')[0] || '';
       parts.push(`CSV columns: ${csvHeader}`);
@@ -492,6 +592,7 @@ ${pageList}
   ✓ react-router-dom           — routing (<BrowserRouter>, <Routes>, <Route>, <Link>)
   ✓ leaflet, react-leaflet     — maps (<MapContainer>, <TileLayer>, <Marker>, <Popup>)
   ✓ recharts                   — charts (<LineChart>, <BarChart>, <PieChart>, <Area>, etc.)
+  ✓ @turf/turf                 — geospatial analysis (import * as turf from '@turf/turf'; turf.convex, turf.centroid, turf.buffer, turf.distance, turf.nearestPoint, turf.length, turf.hexGrid, turf.pointsWithinPolygon …)
 ${opts.experimentMode
   ? '  ✓ parseCSV helper           — use parseCSV(DATA_CSV) for inline data (DO NOT import papaparse, DO NOT call Papa.parse)'
   : '  ✓ papaparse                  — CSV parsing (import Papa from \'papaparse\'; Papa.parse())'}
@@ -647,6 +748,8 @@ function buildSingleFileFixMessages(filePath, fileContent, fileErrors, attempt, 
       } else if (safe) {
         parts.push(`CSV asset path: /data/${safe}.csv — fetch at runtime`);
       }
+    } else if (pageContext.openApiFile) {
+      parts.push(...openApiContextLines(pageContext, ''));
     } else if (pageContext.type === 'geovisualization') {
       parts.push('Page type: GEO MAP — use react-leaflet. No CSV was provided; use placeholder coordinates.');
     } else if (pageContext.type === 'base') {
@@ -785,6 +888,8 @@ function buildRuntimeFixMessages(filePath, fileContent, runtimeIssue, pageContex
       const safe = (pageContext.name || '').replace(/[^a-zA-Z0-9]/g, '');
       parts.push(`CSV columns (use EXACTLY): ${cols.join(', ')}${rolesStr ? ` | roles: ${rolesStr}` : ''}`);
       if (safe) parts.push(`CSV path: /data/${safe}.csv`);
+    } else if (pageContext.openApiFile) {
+      parts.push(...openApiContextLines(pageContext, ''));
     }
     if (parts.length) dataContext = `\n════ PAGE DATA CONTEXT ════\n${parts.join('\n')}\n`;
   }
@@ -987,9 +1092,90 @@ async function postWithRetry(url, body, config, maxRetries = 4) {
   throw lastErr;
 }
 
+/**
+ * openaiChatStream — streams /v1/chat/completions from an OpenAI-compatible server
+ * (LiteLLM → vLLM). Accepts Ollama-style options so callers stay unchanged.
+ * Reasoning tokens (vLLM reasoning parser) are re-wrapped in <think>…</think> so the
+ * existing extractPlan/extractFiles stripping logic keeps working.
+ * A trailing assistant message is treated as a prefill (continue_final_message).
+ */
+async function openaiChatStream(model, messages, onToken, options = {}, enableThinking = false) {
+  const o = { ...options, ...runOverrides() };
+  const isPrefill = messages.length > 0 && messages[messages.length - 1].role === 'assistant';
+  const body = {
+    model,
+    messages,
+    stream: true,
+    temperature: o.temperature,
+    top_p: o.top_p,
+    chat_template_kwargs: { enable_thinking: enableThinking },
+  };
+  const maxTokens = o.max_tokens ?? o.num_predict;
+  if (maxTokens && maxTokens > 0) body.max_tokens = maxTokens + (enableThinking ? THINKING_TOKEN_BUDGET : 0);
+  if (o.seed !== undefined && o.seed !== null) body.seed = o.seed;
+  if (o.top_k !== undefined) body.top_k = o.top_k;
+  if (o.repeat_penalty !== undefined) body.repetition_penalty = o.repeat_penalty;
+  if (isPrefill) {
+    body.continue_final_message = true;
+    body.add_generation_prompt = false;
+  }
+
+  const response = await postWithRetry(`${OPENAI_BASE_URL}/chat/completions`, body, {
+    responseType: 'stream',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(OPENAI_API_KEY ? { Authorization: `Bearer ${OPENAI_API_KEY}` } : {}),
+    },
+    timeout: 1800000,
+  });
+
+  let full = '';
+  let buf = '';
+  let inThink = false;
+  const emit = (t) => { full += t; if (onToken) onToken(t); };
+  await new Promise((resolve, reject) => {
+    response.data.on('data', (chunk) => {
+      buf += chunk.toString();
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') { resolve(); continue; }
+        try {
+          const delta = JSON.parse(payload).choices?.[0]?.delta || {};
+          const reasoning = delta.reasoning_content || delta.reasoning || '';
+          if (reasoning) {
+            if (!inThink) { emit('<think>'); inThink = true; }
+            emit(reasoning);
+          }
+          if (delta.content) {
+            if (inThink) { emit('</think>\n'); inThink = false; }
+            emit(delta.content);
+          }
+        } catch (_) { /* keep-alive / partial */ }
+      }
+    });
+    response.data.on('end', resolve);
+    response.data.on('error', reject);
+  });
+  if (inThink) emit('</think>\n');
+  return full;
+}
+
 async function generate(model, prompt, onToken, maxTokens = 2000, options = {}) {
   console.log(`[Generate] Model: ${model}, Prompt length: ${prompt.length} chars`);
   console.log(`[Generate] ── PROMPT ──\n${prompt}\n[Generate] ── END PROMPT ──`);
+  if (LLM_PROVIDER === 'openai') {
+    const full = await openaiChatStream(
+      model, [{ role: 'user', content: prompt }], onToken,
+      { num_predict: maxTokens, temperature: 0.1, top_p: 0.9, ...options },
+      THINKER_ENABLE_THINKING,
+    );
+    console.log(`[Generate] Completed. Output: ${full.length} chars`);
+    return full;
+  }
   // temperature=0.1 + top_p=0.9 → near-deterministic output; caller options override
   const ollamaOptions = { num_predict: maxTokens, num_ctx: 32768, temperature: 0.1, top_p: 0.9, ...options };
 
@@ -1050,6 +1236,15 @@ async function chat(model, messages, onToken, options = {}) {
   const chatOptions = { num_predict: -1, num_ctx: 32768, temperature: 0.1, top_p: 0.9, ...options };
   console.log(`[Chat] Model: ${model}, Messages: ${messages.length}, total chars: ${messages.reduce((s,m)=>s+(m.content||'').length,0)}`);
   console.log(`[Chat] ── MESSAGES ──\n${messages.map(m=>`[${m.role}]\n${m.content}`).join('\n---\n')}\n[Chat] ── END MESSAGES ──`);
+  if (LLM_PROVIDER === 'openai') {
+    const full = await openaiChatStream(
+      model, messages.map(m => ({ role: m.role, content: m.content })), onToken,
+      { temperature: 0.1, top_p: 0.9, ...options },
+      CODER_ENABLE_THINKING,
+    );
+    console.log(`[Chat] Completed. Output: ${full.length} chars`);
+    return full;
+  }
 
   const maxRetries = 3;
   let lastErr;
@@ -1103,6 +1298,7 @@ async function chat(model, messages, onToken, options = {}) {
  * without competing for memory. Uses keep_alive:0 with an empty prompt.
  */
 async function unloadModel(model) {
+  if (LLM_PROVIDER === 'openai') return; // vLLM keeps a single resident model
   try {
     await axios.post(
       `${OLLAMA_HOST}/api/generate`,
@@ -1208,9 +1404,11 @@ function scaffoldApp(pages) {
     app += `import ${pi.pascal} from './pages/${pi.safe}.jsx';\n`;
   }
   app += '\n';
+  app += '// Generated apps are served under /preview/<projectId>/ — derive the router basename at runtime\n';
+  app += "const ROUTER_BASENAME = (window.location.pathname.match(/^\\/preview\\/[^/]+/) || [''])[0] || '/';\n\n";
   app += 'export default function App() {\n';
   app += '  return (\n';
-  app += '    <BrowserRouter>\n';
+  app += '    <BrowserRouter basename={ROUTER_BASENAME}>\n';
   app += '      <nav className="flex items-center gap-1 px-6 py-3 bg-white border-b border-gray-200 shadow-sm sticky top-0 z-50">\n';
   app += '        <span className="font-bold text-gray-900 text-base mr-4">NSRD</span>\n';
   for (const pi of pageInfos) {
@@ -1421,6 +1619,7 @@ function buildChatMessages(pages, architecturePlan, ragSummary, opts = {}) {
     '  ✓ leaflet, react-leaflet     — maps (<MapContainer>, <TileLayer>, <Marker>, <Popup>)',
     '  ✓ recharts                   — charts (<LineChart>, <BarChart>, <PieChart>, <Area>, etc.)',
     '  ✓ papaparse                  — CSV parsing (import Papa from "papaparse"; Papa.parse())',
+    '  ✓ @turf/turf                 — geospatial analysis (import * as turf from "@turf/turf"; turf.convex, turf.centroid, turf.buffer, turf.distance, turf.nearestPoint, turf.length, turf.hexGrid, turf.pointsWithinPolygon …). Turf uses [lng, lat] coordinate order.',
     '',
     '  ✗ DO NOT import: csv-parser, d3, chart.js, axios, lodash, or ANY other library',
     '  ✗ Use native fetch() for data loading — no axios or other HTTP clients',
@@ -1587,6 +1786,8 @@ function buildChatMessages(pages, architecturePlan, ragSummary, opts = {}) {
             );
           }
         }
+      } else if (pg.openApiFile) {
+        lines.push('', ...openApiContextLines(pg, '', true));
       } else {
         if (leafletTemplate) {
           lines.push(
@@ -1689,6 +1890,12 @@ function buildChatMessages(pages, architecturePlan, ragSummary, opts = {}) {
             );
           }
         }
+      } else if (pg.openApiFile) {
+        lines.push(
+          '', ...openApiContextLines(pg, '', true),
+          '',
+          'CHARTS: use Recharts — always wrap in <ResponsiveContainer width="100%" height={400}>',
+        );
       } else {
         const dashTemplate = tpl('nsrd/MonitoringDashboard.jsx') || rechartsTemplate;
         if (dashTemplate) {
@@ -1813,6 +2020,8 @@ function buildFixChatMessages(pages, currentFiles, errors, fixPlan, opts = {}) {
         } else {
           lines.push(`    CSV asset: /data/${safe}.csv — fetch at runtime`);
         }
+      } else if (pg.openApiFile) {
+        lines.push(...openApiContextLines(pg, '    '));
       } else {
         lines.push(`    No CSV provided — ${pg.type === 'geovisualization' ? 'use placeholder map coords' : 'use sample data'}`);
       }
@@ -1961,10 +2170,14 @@ function buildRuntimeReviewMessages(files, pages, opts = {}) {
       return `Page: ${safe}  type: HOME\n  Static landing page — NO CSV, NO fetch, NO charts, NO maps.\n  ⚠ If this page has fetch() or useEffect loading data → that is a BUG.`;
     }
 
-    const lines = opts.experimentMode
+    const lines = pg.openApiFile
+      ? [`Page: ${safe}  type: ${pg.type}  data source: OpenAPI REST API (no CSV, no /data/ path)`]
+      : opts.experimentMode
       ? [`Page: ${safe}  type: ${pg.type}  CSV: embedded INLINE (no fetch, no /data/ path)`]
       : [`Page: ${safe}  type: ${pg.type}  fetchPath: /data/${safe}.csv`];
-    if (pg.csvFile) {
+    if (pg.openApiFile) {
+      lines.push(...openApiContextLines(pg, '  '));
+    } else if (pg.csvFile) {
       const { cols, roles, colMeta, mapCenter, mapZoom, papaSnippet } = analyzeCSV(pg.csvFile.content);
       lines.push(`  Confirmed lat column : "${roles.lat || 'NONE'}"  (must use row['${roles.lat}'])`);
       lines.push(`  Confirmed lng column : "${roles.lng || 'NONE'}"  (must use row['${roles.lng}'])`);
@@ -1992,7 +2205,7 @@ function buildRuntimeReviewMessages(files, pages, opts = {}) {
     '════ RUNTIME BUGS TO DETECT ════',
     opts.experimentMode
       ? '1. ANY fetch() call — this experiment uses ONLY inline CSV; flag any fetch() as a bug.'
-      : '1. Wrong fetch path — fetch("/data/X.csv") where X does not match the expected filename above',
+      : '1. Wrong fetch path — fetch("/data/X.csv") where X does not match the expected filename above, or a fetch to an API endpoint that is NOT documented above (pages with an OpenAPI data source must not fetch CSV)',
     '2. Wrong CSV column index — c[3] when that column is at a different index',
     '3. NaN coordinates — parseFloat on a string column, or swapped lat/lng indices',
     '4. Missing null/empty guard — .map() or .filter() on state initialised as null/undefined (use [])',
@@ -2221,6 +2434,11 @@ function parseRuntimeIssues(reviewOutput) {
 }
 
 module.exports = {
+  LLM_PROVIDER,
+  OPENAI_BASE_URL,
+  OPENAI_API_KEY,
+  LLM_DEFAULT_MODEL,
+  llmContext,
   buildPrompt,
   buildThinkPrompt,
   buildThinkFixPrompt,

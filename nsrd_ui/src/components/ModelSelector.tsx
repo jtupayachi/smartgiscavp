@@ -89,6 +89,19 @@ const ModelSelector: React.FC<Props> = ({
         });
         if (!res.ok) throw new Error();
         const data = await res.json();
+        if (data.provider === 'openai') {
+          // LiteLLM/vLLM: every served model can act as Thinker and Coder.
+          const all: OllamaModel[] = (data.models ?? []).map((m: any) => ({ id: m.name, name: m.name, size: 'vLLM' }));
+          setCoderModels(all);
+          setThinkerModels(all);
+          const def = all.find((m) => m.id === data.defaultModel) || all[0];
+          if (def) {
+            onCoderRef.current(def.id);
+            onThinkerRef.current(def.id);
+          }
+          setStatus(all.length ? 'ok' : 'err');
+          return;
+        }
         const raw: OllamaModel[] = (data.models ?? []).map((m: any) => ({
           id: m.name,
           name: m.name.split(':')[0],

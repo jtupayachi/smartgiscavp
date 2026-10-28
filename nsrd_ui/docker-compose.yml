@@ -31,7 +31,8 @@ services:
       - ../reference-codebases:/reference-codebases:ro
       # Persist build output — bind-mount so host `npm run build` is live in container
       - ./build:/app/build
-      - projects_data:/app/projects
+      # Generated projects: named volume by default; set NSRD_PROJECTS_DIR (in .env) to a host path to bind-mount instead
+      - ${NSRD_PROJECTS_DIR:-projects_data}:/app/projects
       # Persist RAG cache (FAISS index and embeddings)
       - rag_cache:/app/.cache
       # Keep baked-in node_modules from image (don't overwrite)
@@ -45,8 +46,16 @@ services:
       - ./templates/react-app/tailwind.config.js:/app/templates/react-app/tailwind.config.js
       - ./templates/react-app/src/main.jsx:/app/templates/react-app/src/main.jsx
       - ./templates/react-app/src/index.css:/app/templates/react-app/src/index.css
+    env_file:
+      - .env.litellm
     environment:
       - NODE_ENV=production
+      # LLM backend: LiteLLM proxy (OpenAI-compatible) in front of the local vLLM server
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-http://litellm:4000/v1}
+      - LLM_DEFAULT_MODEL=${LLM_DEFAULT_MODEL:-ornl-qwen3-8-27b}
+      - LLM_THINKER_ENABLE_THINKING=${LLM_THINKER_ENABLE_THINKING:-true}
+      - LLM_CODER_ENABLE_THINKING=${LLM_CODER_ENABLE_THINKING:-false}
       - VIRTUAL_HOST=demo2.recoil.ise.utk.edu
       - VIRTUAL_PORT=80
       - LETSENCRYPT_HOST=demo2.recoil.ise.utk.edu
@@ -60,15 +69,21 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     networks:
       - default
-      - nsrd-network
+      - llm-gateway
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
 volumes:
   projects_data:
   rag_cache:
 
 networks:
-  nsrd-network:
+  # Network of the existing LiteLLM container (/home/cloud/local-gateway)
+  llm-gateway:
     external: true
-    name: nginx-proxy
+    name: local-gateway_default
 

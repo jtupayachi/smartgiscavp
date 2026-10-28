@@ -11,6 +11,8 @@ const PORT = process.env.PORT || 80;
 
 // Projects directory - where we'll save all projects
 const PROJECTS_DIR = path.join(__dirname, 'projects');
+const ROUNDS_DIR = path.join(PROJECTS_DIR, '_rounds');  // per-repair-round snapshots (experiment telemetry)
+const MOCK_DIR = path.join(PROJECTS_DIR, '_mock');      // OpenAPI mock fixtures
 
 // Deduplicate pipeline runs — keyed by a fingerprint of the request body
 // so a client reconnect does not launch a second generation.
@@ -390,6 +392,20 @@ app.get('/api/projects/list', async (req, res) => {
 
 // Get available models from Ollama
 app.get('/api/ollama/tags', async (req, res) => {
+  if (pipeline.LLM_PROVIDER === 'openai') {
+    // Translate OpenAI /v1/models (LiteLLM) into the Ollama tags shape the UI expects.
+    try {
+      const r = await axios.get(`${pipeline.OPENAI_BASE_URL}/models`, {
+        headers: pipeline.OPENAI_API_KEY ? { Authorization: `Bearer ${pipeline.OPENAI_API_KEY}` } : {},
+        timeout: 15000,
+      });
+      const models = (r.data.data || []).map((m) => ({ name: m.id, model: m.id, size: 0 }));
+      return res.json({ provider: 'openai', defaultModel: pipeline.LLM_DEFAULT_MODEL, models });
+    } catch (error) {
+      console.error('Error fetching models from OpenAI-compatible backend:', error.message);
+      return res.status(503).json({ error: 'Cannot reach LLM backend', message: error.message });
+    }
+  }
   try {
     console.log('Fetching models from Viridian Ollama...');
     console.log(`URL: ${OLLAMA_HOST}/api/tags`);
@@ -544,7 +560,12 @@ app.post('/api/ollama/generate', async (req, res) => {
 // fully async in the background. The client subscribes to progress via
 // GET /api/pipeline/stream/:projectId (all events are buffered there).
 app.post('/api/pipeline/run', (req, res) => {
-  const { pages, model, thinkerModel, existingProjectId, experimentMode } = req.body;
+  const { pages, model, thinkerModel, existingProjectId, experimentMode, sampling } = req.body;
+  // Optional per-run sampling overrides, e.g. { temperature, top_p, seed } (used by the experiment harness)
+  const samplingOpts = {};
+  for (const k of ['temperature', 'top_p', 'top_k', 'seed']) {
+    if (sampling && typeof sampling[k] === 'number') samplingOpts[k] = sampling[k];
+  }
   if (!pages || !model) {
     return res.status(400).json({ error: 'pages and model required' });
   }
@@ -559,7 +580,53 @@ app.post('/api/pipeline/run', (req, res) => {
   res.json({ projectId });
 
   // Fire-and-forget: errors are written into the job event buffer.
-  (async () => {
+  pipeline.llmContext.run(samplingOpts, async () => {
+  const runStartedAt = Date.now();
+  // ── Repair-round telemetry ──
+  // Every Vite build is one "round" (r0 = first build of the first generation).
+  // Source of every round and dist of every successful round are snapshotted to
+  // projects/_rounds/<projectId>/r<k>/ so pre-repair and intermediate states can be
+  // evaluated independently (served at /preview/<projectId>--r<k>/).
+  const telemetry = {
+    projectId, model, thinkerModel: thinkModel, sampling: samplingOpts,
+    startedAt: new Date(runStartedAt).toISOString(), status: 'running',
+    rounds: [], genFailures: [], llmCalls: { think: 0, generate: 0, fix: 0, review: 0, reviewFix: 0 },
+  };
+  let nextTrigger = 'initial';
+  const roundsDir = path.join(ROUNDS_DIR, projectId);
+  await fs.rm(roundsDir, { recursive: true, force: true }).catch(() => {});
+  const recordRound = async (files, buildOk, gen, fix, errText) => {
+    const k = telemetry.rounds.length;
+    const rDir = path.join(roundsDir, `r${k}`);
+    try {
+      for (const f of files || []) {
+        const fp = path.join(rDir, f.path);
+        await fs.mkdir(path.dirname(fp), { recursive: true });
+        await fs.writeFile(fp, f.content, 'utf-8');
+      }
+      if (buildOk) await fs.cp(path.join(PROJECTS_DIR, projectId, 'dist'), path.join(rDir, 'dist'), { recursive: true });
+    } catch (e) { console.warn(`[Telemetry] snapshot r${k} failed: ${e.message}`); }
+    const entry = {
+      round: k, gen, fix, trigger: nextTrigger, buildOk,
+      elapsedMs: Date.now() - runStartedAt,
+      pageFiles: (files || []).filter(f => f.path.startsWith('src/pages/')).map(f => f.path),
+      error: errText ? String(errText).slice(0, 4000) : null,
+      previewUrl: buildOk ? `/preview/${projectId}--r${k}/` : null,
+    };
+    telemetry.rounds.push(entry);
+    send({ step: 'round', ...entry });
+  };
+  const finishTelemetry = async (status, extra = {}) => {
+    Object.assign(telemetry, { status, finishedAt: new Date().toISOString(), durationMs: Date.now() - runStartedAt, ...extra });
+    const okRounds = telemetry.rounds.filter(r => r.buildOk);
+    telemetry.firstBuildOkRound = okRounds.length ? okRounds[0].round : null;
+    telemetry.finalRound = status === 'complete' && okRounds.length ? okRounds[okRounds.length - 1].round : null;
+    try {
+      await fs.mkdir(roundsDir, { recursive: true });
+      await fs.writeFile(path.join(roundsDir, 'telemetry.json'), JSON.stringify(telemetry, null, 1));
+    } catch (e) { console.warn(`[Telemetry] write failed: ${e.message}`); }
+    send({ step: 'telemetry', telemetry });
+  };
   const trimmedPages = pages.map((pg) => {
     if (!pg.csvFile) return pg;
     const lines = pg.csvFile.content.split('\n');
@@ -626,6 +693,7 @@ app.post('/api/pipeline/run', (req, res) => {
 
     while (regenAttempt <= MAX_REGEN) {
       if (regenAttempt > 0) {
+        nextTrigger = 'regen';
         send({
           step: 'regenerating',
           status: 'running',
@@ -645,6 +713,7 @@ app.post('/api/pipeline/run', (req, res) => {
           thinkTokenCount++;
           send({ step: 'thinking', token: tok });
         });
+        telemetry.llmCalls.think++;
         // Explicitly unload thinker before loading coder — frees VRAM immediately
         send({ step: 'thinking', status: 'done', message: `Architecture plan ready — unloading thinker…` });
         await pipeline.unloadModel(thinkModel);
@@ -664,6 +733,7 @@ app.post('/api/pipeline/run', (req, res) => {
         //   SVG id/class names → layout regions (sidebar, map, chart, table, legend…)
         const ragQuery = trimmedPages.map(pg => {
           const parts = [pg.name, pg.type, pg.requirements || ''];
+          if (pg.openApiFile) parts.push('REST API OpenAPI fetch JSON GeoJSON');
           if (pg.csvFile) {
             const csvHeader = pg.csvFile.content.split('\n')[0] || '';
             parts.push(`CSV columns: ${csvHeader}`);
@@ -719,6 +789,7 @@ app.post('/api/pipeline/run', (req, res) => {
           genTokenCount++;
           send({ step: 'generating', token: tok });
         });
+        telemetry.llmCalls.generate++;
         // Prepend prefill so extractFiles sees the full ===FILE: header
         const lastAssistant = messages.at(-1)?.role === 'assistant' ? messages.at(-1).content : '';
         const rawCodeFull = lastAssistant ? lastAssistant + '\n' + rawCode : rawCode;
@@ -795,6 +866,7 @@ app.post('/api/pipeline/run', (req, res) => {
         let reviewPassed = false;     // runtime review runs at most once per generation
 
         while (attempt <= MAX_FIX) {
+          let builtThisRound = false;
           send({
             step: 'deploying',
             status: 'running',
@@ -802,6 +874,8 @@ app.post('/api/pipeline/run', (req, res) => {
           });
           try {
             await pipeline.deploy(projectId, lastFiles);
+            await recordRound(lastFiles, true, regenAttempt + 1, attempt, null);
+            builtThisRound = true;
             send({
               step: 'deploying',
               status: 'done',
@@ -824,6 +898,7 @@ app.post('/api/pipeline/run', (req, res) => {
                 messages: reviewMsgs.map(m => ({ role: m.role, content: m.content })),
               });
               const reviewRaw = await pipeline.chat(model, reviewMsgs, null);
+              telemetry.llmCalls.review++;
               const issues = pipeline.parseRuntimeIssues(reviewRaw);
               if (issues) {
                 console.log(`[Pipeline] Runtime review found issues (gen ${regenAttempt + 1}):\n${issues.slice(0, 600)}`);
@@ -852,6 +927,7 @@ app.post('/api/pipeline/run', (req, res) => {
                   const fixedRaw = await pipeline.chat(model, fixMsgs, (tok) => {
                     send({ step: 'reviewing', token: tok });
                   });
+                  telemetry.llmCalls.reviewFix++;
                   const fixPrefill = fixMsgs.at(-1)?.role === 'assistant' ? fixMsgs.at(-1).content : '';
                   const fixedRawFull = fixPrefill ? fixPrefill + '\n' + fixedRaw : fixedRaw;
                   const extracted = pipeline.extractFiles(fixedRawFull).filter(
@@ -867,6 +943,7 @@ app.post('/api/pipeline/run', (req, res) => {
                 const reviewSanitized = pipeline.sanitizeFiles(updatedFiles);
                 lastFiles = reviewSanitized.files;
                 reviewPassed = true; // don't re-review after the rebuild — one pass is enough
+                nextTrigger = 'review-fix';
                 send({ step: 'reviewing', status: 'done', message: `Runtime fixes applied — rebuilding…` });
                 attempt++; // consume one fix slot for the rebuild
                 continue;  // go back to top of while loop to rebuild once
@@ -879,6 +956,8 @@ app.post('/api/pipeline/run', (req, res) => {
             break; // build + review passed — done
           } catch (buildErr) {
             const errors = buildErr.stderr || buildErr.stdout || buildErr.message || String(buildErr);
+            // A failure after a successful build (e.g. review LLM call) must not be recorded as a second round
+            if (!builtThisRound) await recordRound(lastFiles, false, regenAttempt + 1, attempt, errors);
             console.error(`[Pipeline] Build failed (gen ${regenAttempt + 1}, fix ${attempt + 1}):`, errors.slice(0, 400));
             if (buildErr.stack && !buildErr.stderr) {
               // Not a Vite build error — log stack trace to find JS bug
@@ -945,6 +1024,7 @@ app.post('/api/pipeline/run', (req, res) => {
               const fixedRaw = await pipeline.chat(model, fixMessages, (tok) => {
                 send({ step: 'fixing', token: tok });
               });
+              telemetry.llmCalls.fix++;
               // Prepend prefill so extractFiles sees the full ===FILE: header
               const fixPrefill = fixMessages.at(-1)?.role === 'assistant' ? fixMessages.at(-1).content : '';
               const fixedRawFull = fixPrefill ? fixPrefill + '\n' + fixedRaw : fixedRaw;
@@ -978,6 +1058,7 @@ app.post('/api/pipeline/run', (req, res) => {
 
             const fixedSanitized = pipeline.sanitizeFiles(updatedFiles);
             lastFiles = fixedSanitized.files;
+            nextTrigger = 'build-fix';
             attempt++;
           }
         }
@@ -986,6 +1067,8 @@ app.post('/api/pipeline/run', (req, res) => {
         break;
 
       } catch (innerErr) {
+        telemetry.genFailures.push({ gen: regenAttempt + 1, rounds: telemetry.rounds.length,
+          error: String(innerErr && innerErr.message || innerErr).slice(0, 1000) });
         if (regenAttempt >= MAX_REGEN) {
           // All regenerations exhausted — surface the error
           throw innerErr;
@@ -1002,6 +1085,7 @@ app.post('/api/pipeline/run', (req, res) => {
       }
     }
 
+    await finishTelemetry('complete');
     send({
       step: 'complete',
       projectId,
@@ -1012,12 +1096,13 @@ app.post('/api/pipeline/run', (req, res) => {
     console.log(`[Pipeline] ✅ Complete event sent for ${projectId} — preview at /preview/${projectId}/`);
   } catch (err) {
     console.error('[Pipeline] Error:', err.message);
+    await finishTelemetry('error', { error: String(err && err.message || err).slice(0, 2000) }).catch(() => {});
     send({ step: 'error', message: err.message });
   } finally {
     job.status = job.status === 'running' ? 'done' : job.status;
   }
 
-  })(); // end background async pipeline
+  }); // end background async pipeline
 });
 
 // ── User clarification reply ─────────────────────────────────────────────────
@@ -1073,12 +1158,128 @@ app.get('/api/pipeline/stream/:projectId', (req, res) => {
   req.on('close', () => job.clients.delete(res));
 });
 
+// ── Repair-round telemetry for a pipeline run ────────────────────────────────
+app.get('/api/pipeline/telemetry/:projectId', async (req, res) => {
+  const id = req.params.projectId;
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) return res.status(400).json({ error: 'bad id' });
+  try {
+    res.type('application/json').send(await fs.readFile(path.join(ROUNDS_DIR, id, 'telemetry.json'), 'utf8'));
+  } catch {
+    res.status(404).json({ error: 'telemetry not found (run still in progress or unknown id)' });
+  }
+});
+
+// Source snapshot of one round: { files: [{path, content}] }
+app.get('/api/pipeline/rounds/:projectId/:round/src', async (req, res) => {
+  const { projectId, round } = req.params;
+  if (!/^[A-Za-z0-9_-]+$/.test(projectId) || !/^\d+$/.test(round)) return res.status(400).json({ error: 'bad id' });
+  const base = path.join(ROUNDS_DIR, projectId, `r${round}`);
+  const files = [];
+  const walk = async (dir, rel) => {
+    for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+      if (e.name === 'dist') continue;
+      const abs = path.join(dir, e.name);
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) await walk(abs, r);
+      else files.push({ path: r, content: await fs.readFile(abs, 'utf8') });
+    }
+  };
+  try { await walk(base, ''); res.json({ files }); }
+  catch { res.status(404).json({ error: 'round not found' }); }
+});
+
+// ═══ OpenAPI MOCK SERVER ═══════════════════════════════════════════════════
+// Fixtures are registered by the experiment harness (or manually) and served
+// same-origin under /mock/<fixtureId>/… so generated apps can call the API
+// documented in the OpenAPI spec attached to a page.
+//   POST /api/mock/fixtures   { id, spec, routes: [{ method, path, query?, status?, body }] }
+const mockFixtures = new Map();   // id → { spec, routes }
+const mockLogs = new Map();       // id → [{ t, method, path, query, matched, status }]
+const MOCK_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+
+async function loadMockFixture(id) {
+  if (mockFixtures.has(id)) return mockFixtures.get(id);
+  try {
+    const fx = JSON.parse(await fs.readFile(path.join(MOCK_DIR, `${id}.json`), 'utf8'));
+    mockFixtures.set(id, fx);
+    return fx;
+  } catch { return null; }
+}
+
+app.post('/api/mock/fixtures', async (req, res) => {
+  const { id, spec, routes } = req.body || {};
+  if (!id || !MOCK_ID_RE.test(id) || !Array.isArray(routes)) {
+    return res.status(400).json({ error: 'id (alnum/_-) and routes[] required' });
+  }
+  const fx = { id, spec: spec || null, routes };
+  await fs.mkdir(MOCK_DIR, { recursive: true });
+  await fs.writeFile(path.join(MOCK_DIR, `${id}.json`), JSON.stringify(fx));
+  mockFixtures.set(id, fx);
+  res.json({ ok: true, id, routes: routes.length, baseUrl: `/mock/${id}` });
+});
+
+app.get('/api/mock/fixtures', async (req, res) => {
+  let ids = [];
+  try { ids = (await fs.readdir(MOCK_DIR)).filter(f => f.endsWith('.json')).map(f => f.slice(0, -5)); } catch {}
+  res.json({ fixtures: ids });
+});
+
+app.get('/api/mock/log/:id', (req, res) => {
+  res.json({ id: req.params.id, requests: mockLogs.get(req.params.id) || [] });
+});
+app.delete('/api/mock/log/:id', (req, res) => { mockLogs.delete(req.params.id); res.json({ ok: true }); });
+
+app.all('/mock/:id/*', async (req, res) => {
+  const { id } = req.params;
+  if (!MOCK_ID_RE.test(id)) return res.status(400).json({ error: 'bad fixture id' });
+  const fx = await loadMockFixture(id);
+  if (!fx) return res.status(404).json({ error: `unknown mock fixture ${id}` });
+  const subPath = '/' + (req.params[0] || '').replace(/\/+$/, '');
+  if (subPath === '/openapi.json' && fx.spec) return res.json(fx.spec);
+  const q = req.query || {};
+  // Best match: same method + path, every fixture query key equal, most specific wins.
+  let best = null; let bestScore = -1;
+  fx.routes.forEach((r, i) => {
+    if ((r.method || 'GET').toUpperCase() !== req.method) return;
+    if (r.path.replace(/\/+$/, '') !== subPath) return;
+    const keys = Object.keys(r.query || {});
+    if (!keys.every(k => String(q[k]) === String(r.query[k]))) return;
+    if (keys.length > bestScore) { best = i; bestScore = keys.length; }
+  });
+  const route = best !== null ? fx.routes[best] : null;
+  const status = route ? (route.status || 200) : 404;
+  const log = mockLogs.get(id) || [];
+  log.push({ t: Date.now(), method: req.method, path: subPath, query: q, matched: best, status, referer: req.get('referer') || '' });
+  if (log.length > 5000) log.shift();
+  mockLogs.set(id, log);
+  if (!route) return res.status(404).json({ error: 'endpoint not documented', path: subPath, query: q });
+  res.status(status).type(route.contentType || 'application/json').send(JSON.stringify(route.body));
+});
+
+// Resolve a preview id to its dist dir: "<projectId>" (final) or "<projectId>--r<k>" (round snapshot)
+function previewDistDir(previewId) {
+  const m = previewId.match(/^(.+)--r(\d+)$/);
+  return m
+    ? path.join(ROUNDS_DIR, m[1], `r${m[2]}`, 'dist')
+    : path.join(pipeline.PROJECTS_DIR, previewId, 'dist');
+}
+
+// ── Root-relative assets requested by a preview (e.g. fetch('/data/Geo.csv')) ──
+// Generated apps reference /data/*.csv absolutely; resolve them against the
+// project whose preview page issued the request (taken from the Referer).
+app.use('/data', (req, res, next) => {
+  const m = (req.get('referer') || '').match(/\/preview\/([A-Za-z0-9_-]+)\//);
+  if (!m) return next();
+  express.static(path.join(previewDistDir(m[1]), 'data'))(req, res, next);
+});
+
 // ── Serve deployed project previews ───────────────
 app.use('/preview', (req, res, next) => {
   const segs = req.path.split('/').filter(Boolean);
   if (!segs.length) return next();
   const projectId = segs[0];
-  const distDir = path.join(pipeline.PROJECTS_DIR, projectId, 'dist');
+  if (!/^[A-Za-z0-9_-]+$/.test(projectId)) return next();
+  const distDir = previewDistDir(projectId);
   // Strip the projectId prefix so express.static finds the file
   const origUrl = req.url;
   req.url = '/' + segs.slice(1).join('/') || '/';
@@ -1104,6 +1305,8 @@ app.get('*', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`   ├─ Static files: ${BUILD_DIR}`);
-  console.log(`   ├─ Ollama proxy: ${OLLAMA_HOST}`);
+  console.log(pipeline.LLM_PROVIDER === 'openai'
+    ? `   ├─ LLM backend (OpenAI-compatible): ${pipeline.OPENAI_BASE_URL} [default model ${pipeline.LLM_DEFAULT_MODEL}]`
+    : `   ├─ Ollama proxy: ${OLLAMA_HOST}`);
   console.log(`   └─ Health check: http://localhost:${PORT}/health`);
 });

@@ -13,6 +13,7 @@ interface Page {
   requirements: string;
   svgFile: { content: string; name: string } | null;
   csvFile: { content: string; name: string } | null;
+  openApiFile?: { content: string; name: string } | null;
 }
 
 /* ── Config ─────────────────────────────────────────── */
@@ -429,8 +430,8 @@ export default function App() {
                 )}
               </div>
 
-              {/* CSV (geo only, optional) */}
-              {active.type === 'geovisualization' && (
+              {/* CSV (geo / stats, optional) */}
+              {(active.type === 'geovisualization' || active.type === 'base') && (
                 <div className="field">
                   <label>CSV Data <span className="opt">optional</span></label>
                   {active.csvFile ? (
@@ -440,6 +441,21 @@ export default function App() {
                     </div>
                   ) : (
                     <FileUpload accept=".csv" onFile={(f) => patch(active.id, { csvFile: f })} />
+                  )}
+                </div>
+              )}
+
+              {/* OpenAPI spec (geo / stats, optional) — page loads data from the documented REST API */}
+              {(active.type === 'geovisualization' || active.type === 'base') && (
+                <div className="field">
+                  <label>OpenAPI Spec <span className="opt">optional · JSON/YAML</span></label>
+                  {active.openApiFile ? (
+                    <div className="chip">
+                      🔌 {active.openApiFile.name}
+                      <button onClick={() => patch(active.id, { openApiFile: null })}>✕</button>
+                    </div>
+                  ) : (
+                    <FileUpload accept=".json,.yaml,.yml" onFile={(f) => patch(active.id, { openApiFile: f })} />
                   )}
                 </div>
               )}

@@ -9,7 +9,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![React](https://img.shields.io/badge/React-18-61dafb?logo=react)](https://reactjs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-4.9-3178c6?logo=typescript)](https://typescriptlang.org)
-[![Ollama](https://img.shields.io/badge/Ollama-LLM-ff6b35)](https://ollama.ai)
+[![vLLM](https://img.shields.io/badge/vLLM-OpenAI--compatible-30a2ff)](https://github.com/vllm-project/vllm)
+[![Release](https://img.shields.io/badge/release-2.0-success)](#release-2-vllm-backend)
 [![Docker Hub](https://img.shields.io/badge/Docker%20Hub-jtupayac%2Fsmartgiscavp-2496ed?logo=docker)](https://hub.docker.com/r/jtupayac/smartgiscavp)
 [![ORNL](https://img.shields.io/badge/Oak%20Ridge-National%20Laboratory-00629b)](https://ornl.gov)
 
@@ -48,12 +49,27 @@ Page types supported:
 
 ---
 
+## Release 2: vLLM backend
+
+Release 2 replaces the Ollama calls of release 1 with an **OpenAI-compatible backend**: every Thinker, Coder, fix, and review call goes to `/v1/chat/completions`, served by **vLLM** behind a **LiteLLM** proxy.
+
+* Default model `ornl-qwen3-8-27b` (Qwen3.8-27B on vLLM) for all roles; Qwen3 `enable_thinking` is on for the Thinker and off for the Coder (`LLM_THINKER_ENABLE_THINKING`, `LLM_CODER_ENABLE_THINKING`).
+* Per-run sampling overrides (seed, temperature, top-p) for reproducible experiments.
+* Pages can carry an **OpenAPI 3.x spec** instead of a CSV; generated apps call the documented endpoints with `fetch`, and a fixture-driven mock REST API is served at `/mock/<fixture>/*`.
+* **Turf.js 7.4.0** is pinned in the project template for client-side spatial analysis.
+* Every Vite build is snapshotted as a repair round (`/preview/<id>--r<k>/`), with telemetry at `GET /api/pipeline/telemetry/<id>`.
+* Ollama is still available as a legacy option: `LLM_PROVIDER=ollama`.
+
+The scaled-up evaluation of this release (840 runs, design, scripts, and results) is at https://huggingface.co/datasets/jtupayac/smartgiscavp-scaled-experiment. See [`nsrd_ui/README.md`](nsrd_ui/README.md) for the vLLM/LiteLLM deployment.
+
+---
+
 ## Quick Start
 
 ```bash
 git clone https://github.com/jtupayachi/smartgiscavp_ui.git
 cd smartgiscavp/smartgiscavp
-cp .env.example .env          # edit OLLAMA_HOST and credentials
+cp .env.litellm.example .env.litellm   # set OPENAI_API_KEY (LiteLLM key), never commit
 docker compose up --build
 ```
 
@@ -63,7 +79,22 @@ Open **http://localhost:8432** in your browser.
 
 ---
 
-## Connecting Your Ollama Server
+## Connecting the LLM backend (vLLM via LiteLLM, default)
+
+```ini
+# docker-compose.yml environment / .env
+LLM_PROVIDER=openai                      # default in release 2
+OPENAI_BASE_URL=http://litellm:4000/v1   # LiteLLM proxy in front of vLLM (any OpenAI-compatible server works)
+LLM_DEFAULT_MODEL=ornl-qwen3-8-27b
+# .env.litellm
+OPENAI_API_KEY=sk-...                    # LiteLLM key
+```
+
+> **Verify the connection:** `curl -H "Authorization: Bearer $OPENAI_API_KEY" $OPENAI_BASE_URL/models`
+
+### Legacy: Ollama server (release 1)
+
+Set `LLM_PROVIDER=ollama` and configure the Ollama variables below.
 
 All credentials live in **`.env`** — never hardcoded. Copy the template and fill in your values:
 
@@ -128,7 +159,7 @@ smartgiscavp/
 │   │   ├── App.tsx            ← Main UI component
 │   │   ├── App.css            ← Swiss brutalist theme
 │   │   └── components/        ← FileUpload, SVGEditor, ModelSelector, TabHealthBadges
-│   ├── server.js              ← Express backend + Ollama proxy
+│   ├── server.js              ← Express backend + LLM proxy (vLLM/LiteLLM or Ollama)
 │   ├── pipeline.js            ← Thinker→Coder→Build pipeline
 │   ├── sanitizer.js           ← LLM output validation & repair
 │   ├── referenceAnalyzer_rag.js ← RAG retrieval from golden examples
@@ -164,7 +195,13 @@ Golden examples live in `reference-codebases/golden-examples/src/` — add your 
 
 | Variable | Default | Description |
 |---|---|---|
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
+| `LLM_PROVIDER` | `openai` | `openai` (vLLM/LiteLLM, release 2) or `ollama` (legacy) |
+| `OPENAI_BASE_URL` | `http://litellm:4000/v1` | OpenAI-compatible endpoint |
+| `OPENAI_API_KEY` | *(blank)* | Key of the OpenAI-compatible proxy |
+| `LLM_DEFAULT_MODEL` | `ornl-qwen3-8-27b` | Model used for all roles |
+| `LLM_THINKER_ENABLE_THINKING` / `LLM_CODER_ENABLE_THINKING` | `true` / `false` | Qwen3 thinking mode per role |
+| `NSRD_PROJECTS_DIR` | named volume | Host directory for generated projects |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL (legacy) |
 | `OLLAMA_USER` | *(blank)* | Basic auth username |
 | `OLLAMA_PASSWORD` | *(blank)* | Basic auth password |
 | `OLLAMA_API_KEY` | *(blank)* | Bearer token (alternative to basic auth) |
@@ -192,9 +229,9 @@ environment:
 ```bash
 docker pull jtupayac/smartgiscavp
 docker run -p 8432:80 \
-  -e OLLAMA_HOST=http://your-ollama:11434 \
-  -e OLLAMA_USER=your_user \
-  -e OLLAMA_PASSWORD=your_pass \
+  -e OPENAI_BASE_URL=http://your-litellm:4000/v1 \
+  -e OPENAI_API_KEY=your_key \
+  -e LLM_DEFAULT_MODEL=ornl-qwen3-8-27b \
   jtupayac/smartgiscavp
 ```
 
@@ -211,7 +248,7 @@ Browser
   └─ Express.js server (server.js)
         ├─ POST /api/pipeline/run     → start generation job
         ├─ GET  /api/pipeline/stream/:id → SSE event stream
-        ├─ GET  /api/models           → proxy Ollama /api/tags
+        ├─ GET  /api/models           → OpenAI-compatible /v1/models (Ollama /api/tags in legacy mode)
         ├─ POST /api/pipeline/clarify → answer model questions
         └─ GET  /preview/:id/         → serve generated app
               │
@@ -235,7 +272,7 @@ Browser
 |---|---|
 | Frontend | React 18 · TypeScript · IBM Plex Mono · Playfair Display |
 | Backend | Node.js · Express.js · SSE streaming |
-| LLM | Ollama · Anthropic Claude · LangChain.js |
+| LLM | vLLM + LiteLLM (OpenAI-compatible) · Ollama (legacy) · Anthropic Claude · LangChain.js |
 | Build | Vite · Tailwind CSS (generated apps) |
 | RAG | Python · FastAPI · FAISS · sentence-transformers |
 | Deploy | Docker · nginx |
